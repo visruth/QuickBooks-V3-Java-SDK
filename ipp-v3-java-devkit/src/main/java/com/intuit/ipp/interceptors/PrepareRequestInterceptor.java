@@ -60,7 +60,9 @@ public class PrepareRequestInterceptor implements Interceptor {
 
 		if (intuitMessage.isPlatformService()) {
 			requestParameters.put(RequestElements.REQ_PARAM_RESOURCE_URL, prepareIPSUri(action, requestElements.getContext()));
-		} else {
+		} else if (intuitMessage.isEntitlementService()) {
+			prepareEntitlementsRequest(intuitMessage, requestElements, requestParameters);
+		}else {
 			prepareDataServiceRequest(intuitMessage, requestElements, requestParameters, action);
 		}
 
@@ -86,7 +88,7 @@ public class PrepareRequestInterceptor implements Interceptor {
 	private void prepareDataServiceRequest(IntuitMessage intuitMessage, RequestElements requestElements, Map<String, String> requestParameters,
 			String action) throws FMSException {
 		requestParameters.put(RequestElements.REQ_PARAM_RESOURCE_URL,
-				getUri(intuitMessage.isPlatformService(), action, requestElements.getContext(), requestParameters));
+				getUri(intuitMessage.isPlatformService(), action, requestElements.getContext(), requestParameters, intuitMessage.isEntitlementService()));
 
 		Map<String, String> requestHeaders = requestElements.getRequestHeaders();
 
@@ -101,6 +103,9 @@ public class PrepareRequestInterceptor implements Interceptor {
             // add content type, except POST queries with email ("<entity>/id/send?...") - it has no POST body
 			if (StringUtils.hasText(serializeFormat) && !isSendEmail(requestParameters)) {
 				requestHeaders.put(RequestElements.HEADER_PARAM_CONTENT_TYPE, ContentTypes.getContentType(serializeFormat));
+			} 
+			else if (StringUtils.hasText(serializeFormat) && isSendEmail(requestParameters)) {
+				requestHeaders.put(RequestElements.HEADER_PARAM_CONTENT_TYPE, ContentTypes.OCTECT_STREAM.toString());
 			}
 		}
 
@@ -121,6 +126,33 @@ public class PrepareRequestInterceptor implements Interceptor {
 		}
 	}
 
+	private void prepareEntitlementsRequest(IntuitMessage intuitMessage, RequestElements requestElements, Map<String, String> requestParameters) throws FMSException {
+		requestParameters.put(RequestElements.REQ_PARAM_RESOURCE_URL,
+				getUri(intuitMessage.isPlatformService(), null, requestElements.getContext(), requestParameters, intuitMessage.isEntitlementService()));
+
+		Map<String, String> requestHeaders = requestElements.getRequestHeaders();
+
+		//set content type to xml since Entitlement API supports only XML
+		requestHeaders.put(RequestElements.HEADER_PARAM_CONTENT_TYPE, ContentTypes.XML.toString());
+		requestHeaders.put(RequestElements.HEADER_PARAM_ACCEPT, ContentTypes.XML.toString());
+
+		// validates whether to add headers for content-encoding for compression
+		String compressFormat = Config.getProperty(Config.COMPRESSION_REQUEST_FORMAT);
+		if (StringUtils.hasText(compressFormat) && CompressorFactory.isValidCompressFormat(compressFormat)) {
+			requestHeaders.put(RequestElements.HEADER_PARAM_CONTENT_ENCODING, compressFormat);
+		}
+
+        setupAcceptEncoding(requestHeaders);
+        //setupAcceptHeader(null, requestHeaders, requestParameters);
+
+
+        UUID trackingID = requestElements.getContext().getTrackingID();
+		if(!(trackingID==null))
+		{
+			requestHeaders.put(RequestElements.HEADER_INTUIT_TID, trackingID.toString());
+		}
+	}
+	
     /**
      * Setup accept encoding header from configuration
      * @param requestHeaders
@@ -194,12 +226,16 @@ public class PrepareRequestInterceptor implements Interceptor {
 	 *            the request params
 	 * @return returns URI
 	 */
-	private <T extends IEntity> String getUri(Boolean platformService, String action, Context context, Map<String, String> requestParameters)
+	private <T extends IEntity> String getUri(Boolean platformService, String action, Context context, Map<String, String> requestParameters, Boolean entitlementService)
 			throws FMSException {
 		String uri = null;
 		if (!platformService) {
+			
 			ServiceType serviceType = context.getIntuitServiceType();
-			if (ServiceType.QBO == serviceType) {
+			if (entitlementService) {
+				uri = prepareEntitlementUri(context);
+			}
+			else if (ServiceType.QBO == serviceType) {
 				uri = prepareQBOUri(action, context, requestParameters);
 			} else if (ServiceType.QBOPremier == serviceType) {
 				uri = prepareQBOPremierUri(action, context, requestParameters);
@@ -218,9 +254,14 @@ public class PrepareRequestInterceptor implements Interceptor {
      *
      * @return URL
      */
-    protected String getBaseUrlQBO()
-    {
-      return Config.getProperty(Config.BASE_URL_QBO);
+    protected String getBaseUrl(String url) {
+    	if (url.endsWith("/")) {
+    	    return url.substring(0, url.length() - 1);
+    	}
+    	else {
+    	    return url;
+    	}
+    	
     }
 
 	/**
@@ -246,9 +287,10 @@ public class PrepareRequestInterceptor implements Interceptor {
 				}
 		
 		// constructs request URI
-		uri.append(getBaseUrlQBO()).append("/").append(context.getRealmID()).append("/").append(entityName);
+		uri.append(getBaseUrl(Config.getProperty(Config.BASE_URL_QBO))).append("/").append(context.getRealmID()).append("/").append(entityName);
         addEntityID(requestParameters, uri);
         addEntitySelector(requestParameters, uri);
+        addParentID(requestParameters, uri);
 
         // adds the built request param
       /*  if(requestParameters.equals("updateaccountontxns"))
@@ -266,7 +308,7 @@ public class PrepareRequestInterceptor implements Interceptor {
 		
 		if(context.getMinorVersion() == null)
 		{
-		context.setMinorVersion("8");
+		context.setMinorVersion("35");
 		}
 		
 		uri.append("minorversion").append("=").append(context.getMinorVersion()).append("&");
@@ -306,6 +348,12 @@ public class PrepareRequestInterceptor implements Interceptor {
     private void addEntitySelector(Map<String, String> requestParameters, StringBuilder uri) {
         if (StringUtils.hasText(requestParameters.get(RequestElements.REQ_PARAM_ENTITY_SELECTOR))) {
             uri.append("/").append(requestParameters.get(RequestElements.REQ_PARAM_ENTITY_SELECTOR));
+        }
+    }
+    
+    private void addParentID(Map<String, String> requestParameters, StringBuilder uri) {
+        if (StringUtils.hasText(requestParameters.get(RequestElements.REQ_PARAM_PARENT_ID))) {
+            uri.append("/").append(requestParameters.get(RequestElements.REQ_PARAM_PARENT_ID)).append("/children");
         }
     }
 
@@ -366,6 +414,13 @@ public class PrepareRequestInterceptor implements Interceptor {
 			.append("?act=").append(action).append("&token=").append(context.getAppToken());
 		return uri.toString();
 	}
+	
+	private String prepareEntitlementUri(Context context) throws FMSException {
+		StringBuilder uri = new StringBuilder();
+		uri.append(getBaseUrl(Config.getProperty(Config.BASE_URL_ENTITLEMENTSERVICE))).append("/").
+		append("entitlements").append("/").append("v3").append("/").append(context.getRealmID());
+		return uri.toString();
+	}
 
 	/**
 	 * Method to build the request params which are to be added in the URI
@@ -418,6 +473,7 @@ public class PrepareRequestInterceptor implements Interceptor {
                 || key.equals(RequestElements.REQ_PARAM_START_POS)
                 || key.equals(RequestElements.REQ_PARAM_MAX_RESULTS)
                 || key.equals(RequestElements.REQ_PARAM_SENDTO)
+                || key.equals(RequestElements.REQ_PARAM_LEVEL)
                 || key.equals(RequestElements.REPORT_PARAM_START_DT)
                 || key.equals(RequestElements.REPORT_PARAM_END_DT)
                 || key.equals(RequestElements.REPORT_PARAM_DT_MACRO)
@@ -431,7 +487,46 @@ public class PrepareRequestInterceptor implements Interceptor {
                 || key.equals(RequestElements.REPORT_PARAM_QZURL)
                 || key.equals(RequestElements.REPORT_PARAM_AGING_PERIOD)
                 || key.equals(RequestElements.REPORT_PARAM_NUM_PERIOD)
-                || key.equals(RequestElements.REPORT_PARAM_REPORT_DT);
+                || key.equals(RequestElements.REPORT_PARAM_REPORT_DT)
+                || key.equals(RequestElements.REPORT_PARAM_COLUMNS)
+                || key.equals(RequestElements.REPORT_PARAM_ACCOUNT)
+        		|| key.equals(RequestElements.REPORT_PARAM_ACCOUNT_TYPE)
+        		|| key.equals(RequestElements.REPORT_PARAM_SOURCE_ACCOUNT_TYPE)
+        		|| key.equals(RequestElements.REPORT_PARAM_SORT_BY)
+        		|| key.equals(RequestElements.REPORT_PARAM_SORT_ORDER)
+        		|| key.equals(RequestElements.REPORT_PARAM_SOURCE_ACCOUNT)
+        		|| key.equals(RequestElements.REPORT_PARAM_PAYMENT_METHOD)
+        		|| key.equals(RequestElements.REPORT_PARAM_START_DUE_DT)
+        		|| key.equals(RequestElements.REPORT_PARAM_END_DUE_DT)
+        		|| key.equals(RequestElements.REPORT_PARAM_APPAID)
+        		|| key.equals(RequestElements.REPORT_PARAM_ARPAID)
+        		|| key.equals(RequestElements.REPORT_PARAM_BOTH_AMT)
+        		|| key.equals(RequestElements.REPORT_PARAM_CLEARED)
+        		|| key.equals(RequestElements.REPORT_PARAM_CREATE_DT_MACRO)
+        		|| key.equals(RequestElements.REPORT_PARAM_DOC_NUM)
+        		|| key.equals(RequestElements.REPORT_PARAM_DUE_DT_MACRO)
+        		|| key.equals(RequestElements.REPORT_PARAM_GROUP_BY)
+        		|| key.equals(RequestElements.REPORT_PARAM_MEMO)
+        		|| key.equals(RequestElements.REPORT_PARAM_MOD_DT_MACRO)
+        		|| key.equals(RequestElements.REPORT_PARAM_NAME)
+        		|| key.equals(RequestElements.REPORT_PARAM_PRINTED)
+        		|| key.equals(RequestElements.REPORT_PARAM_END_MOD_DT)
+        		|| key.equals(RequestElements.REPORT_PARAM_START_MOD_DT)
+        		|| key.equals(RequestElements.REPORT_PARAM_TERM)
+        		|| key.equals(RequestElements.REPORT_PARAM_TRANSACTION_TYPE)
+        		|| key.equals(RequestElements.REPORT_PARAM_AGING_METHOD)
+        		|| key.equals(RequestElements.REPORT_PARAM_PAST_DUE)
+        		|| key.equals(RequestElements.REPORT_PARAM_CREATE_DT_MACRO)
+        		|| key.equals(RequestElements.REPORT_PARAM_END_CREATED_DT)
+        		|| key.equals(RequestElements.REPORT_PARAM_START_CREATED_DT)
+        		|| key.equals(RequestElements.REPORT_PARAM_JOURNAL_CODE)
+        		|| key.equals(RequestElements.REPORT_PARAM_EMPLOYEE)
+        		|| key.equals(RequestElements.REPORT_PARAM_AGENCY_ID)
+        		|| key.equals(RequestElements.REPORT_PARAM_CUSTOM1)
+        		|| key.equals(RequestElements.REPORT_PARAM_CUSTOM2)
+        		|| key.equals(RequestElements.REPORT_PARAM_CUSTOM3)
+        		|| key.equals(RequestElements.REPORT_PARAM_SHIPVIA)
+        		|| key.equals(RequestElements.REPORT_PARAM_ACCOUNT_STATUS);
     }
 
     /**
